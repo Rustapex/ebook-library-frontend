@@ -157,4 +157,6 @@ export const router = createBrowserRouter([
       { path: 'collections', element: page(<AdminCollectionPage />) },
     ],
   },
-]);
+], {
+  basename: import.meta.env.BASE_URL,
+});
