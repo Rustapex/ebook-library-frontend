@@ -1,0 +1,648 @@
+import { FormEvent, KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useParams } from 'react-router-dom';
+import {
+  changeAdminBookStatus,
+  getAdminBook,
+  updateAdminBook,
+  uploadAdminBookEpub,
+} from '../../../api/adminBookApi';
+import { getCategories } from '../../../api/bookApi';
+import { getApiErrorMessage } from '../../../api/profileApi';
+import { Button } from '../../../components/common/Button';
+import type {
+  AdminBookDetail,
+  AdminBookRentalType,
+  AdminBookStatus,
+  Category,
+} from '../../../types/api';
+import styles from '../../../styles/AdminBookFormPage.module.css';
+
+const MAX_EPUB_FILE_SIZE = 50 * 1024 * 1024;
+
+const fallbackCategories: Category[] = [
+  { categoryId: 1, name: '소설' },
+  { categoryId: 2, name: '경제 / 경영' },
+  { categoryId: 3, name: '인문 / 사회 / 역사' },
+  { categoryId: 4, name: '컴퓨터 / IT' },
+  { categoryId: 5, name: '자기계발' },
+];
+
+function flattenCategories(categories: Category[]): Category[] {
+  return categories.flatMap((category) => [category, ...(category.children ? flattenCategories(category.children) : [])]);
+}
+
+function splitList(value: FormDataEntryValue | null) {
+  return String(value ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+export function AdminBookEditPage() {
+  const { bookId } = useParams();
+  const numericBookId = Number(bookId);
+  const [categories, setCategories] = useState<Category[]>(fallbackCategories);
+  const [book, setBook] = useState<AdminBookDetail | null>(null);
+  const [rentalType, setRentalType] = useState<AdminBookRentalType>('PAID');
+  const [statusValue, setStatusValue] = useState<AdminBookStatus>('AVAILABLE');
+  const [statusReason, setStatusReason] = useState('');
+  const [isStatusModalOpen, setIsStatusModalOpen] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [successMessage, setSuccessMessage] = useState('');
+  const [statusErrorMessage, setStatusErrorMessage] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isChangingStatus, setIsChangingStatus] = useState(false);
+  const [epubFile, setEpubFile] = useState<File | null>(null);
+  const [epubErrorMessage, setEpubErrorMessage] = useState('');
+  const [epubSuccessMessage, setEpubSuccessMessage] = useState('');
+  const [isUploadingEpub, setIsUploadingEpub] = useState(false);
+  const [isEpubConfirmOpen, setIsEpubConfirmOpen] = useState(false);
+  const epubDialogRef = useRef<HTMLDivElement>(null);
+  const epubFileInputRef = useRef<HTMLInputElement>(null);
+  const wasEpubConfirmOpenRef = useRef(false);
+
+  const selectedCategoryIds = useMemo(() => new Set((book?.categories ?? []).map((category) => category.categoryId)), [book]);
+
+  useEffect(() => {
+    let frameId: number | undefined;
+
+    if (isEpubConfirmOpen) {
+      wasEpubConfirmOpenRef.current = true;
+      frameId = window.requestAnimationFrame(() => {
+        epubDialogRef.current?.querySelector<HTMLButtonElement>('button:not([disabled])')?.focus();
+      });
+    } else if (wasEpubConfirmOpenRef.current) {
+      wasEpubConfirmOpenRef.current = false;
+      frameId = window.requestAnimationFrame(() => {
+        epubFileInputRef.current?.focus();
+      });
+    }
+
+    return () => {
+      if (frameId !== undefined) {
+        window.cancelAnimationFrame(frameId);
+      }
+    };
+  }, [isEpubConfirmOpen]);
+
+  useEffect(() => {
+    let ignore = false;
+
+    async function loadCategories() {
+      try {
+        const data = await getCategories();
+        if (!ignore) {
+          setCategories(data.length ? flattenCategories(data) : fallbackCategories);
+        }
+      } catch {
+        if (!ignore) {
+          setCategories(fallbackCategories);
+        }
+      }
+    }
+
+    void loadCategories();
+
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let ignore = false;
+
+    async function loadBook() {
+      setIsLoading(true);
+      setErrorMessage('');
+
+      try {
+        const data = await getAdminBook(numericBookId);
+        if (!ignore) {
+          setBook(data);
+          setRentalType(data.rentalType);
+          setStatusValue(data.status);
+        }
+      } catch (error) {
+        if (!ignore) {
+          setBook(null);
+          setErrorMessage(getApiErrorMessage(error));
+        }
+      } finally {
+        if (!ignore) {
+          setIsLoading(false);
+        }
+      }
+    }
+
+    if (numericBookId) {
+      void loadBook();
+    } else {
+      setIsLoading(false);
+      setErrorMessage('수정할 도서 번호를 확인할 수 없습니다.');
+    }
+
+    return () => {
+      ignore = true;
+    };
+  }, [numericBookId]);
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setErrorMessage('');
+    setSuccessMessage('');
+
+    if (!numericBookId) {
+      setErrorMessage('수정할 도서 번호를 확인할 수 없습니다.');
+      return;
+    }
+
+    const formData = new FormData(event.currentTarget);
+    const title = String(formData.get('title') ?? '').trim();
+    const publisherName = String(formData.get('publisherName') ?? '').trim();
+    const authors = splitList(formData.get('authors'));
+    const categoryIds = formData
+      .getAll('categoryIds')
+      .map((value) => Number(value))
+      .filter(Boolean);
+
+    if (!title) {
+      setErrorMessage('도서 제목을 입력해 주세요.');
+      return;
+    }
+
+    if (!publisherName) {
+      setErrorMessage('출판사를 입력해 주세요.');
+      return;
+    }
+
+    if (authors.length === 0) {
+      setErrorMessage('저자를 1명 이상 입력해 주세요.');
+      return;
+    }
+
+    if (categoryIds.length === 0) {
+      setErrorMessage('카테고리를 1개 이상 선택해 주세요.');
+      return;
+    }
+
+    const rentalPrice = rentalType === 'FREE' ? 0 : Number(formData.get('rentalPrice') ?? 0);
+
+    if (rentalType === 'PAID' && rentalPrice <= 0) {
+      setErrorMessage('유료 도서는 대여 가격을 1원 이상 입력해야 합니다.');
+      return;
+    }
+
+    const payload = {
+      title,
+      isbn: String(formData.get('isbn') ?? '').trim() || undefined,
+      publisherName,
+      authors,
+      categoryIds,
+      rentalType,
+      rentalPrice,
+      defaultRentalDays: Number(formData.get('defaultRentalDays') ?? 14) || 14,
+      coverImageUrl: String(formData.get('coverImageUrl') ?? '').trim() || undefined,
+      description: String(formData.get('description') ?? '').trim() || undefined,
+      tableOfContents: String(formData.get('tableOfContents') ?? '').trim() || undefined,
+      publisherReview: String(formData.get('publisherReview') ?? '').trim() || undefined,
+    };
+
+    setIsSubmitting(true);
+
+    try {
+      await updateAdminBook(numericBookId, payload);
+      const refreshed = await getAdminBook(numericBookId);
+      setBook(refreshed);
+      setRentalType(refreshed.rentalType);
+      setStatusValue(refreshed.status);
+      setSuccessMessage('도서 정보가 수정되었습니다.');
+    } catch (error) {
+      setErrorMessage(getApiErrorMessage(error));
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleStatusChange() {
+    setStatusErrorMessage('');
+
+    if (!numericBookId) {
+      setStatusErrorMessage('수정할 도서 번호를 확인할 수 없습니다.');
+      return;
+    }
+
+    const isActualChange = statusValue !== book?.status;
+
+    if (isActualChange && !statusReason.trim()) {
+      setStatusErrorMessage('상태 변경 사유를 입력해 주세요.');
+      return;
+    }
+
+    setIsChangingStatus(true);
+
+    try {
+      const response = await changeAdminBookStatus(numericBookId, {
+        status: statusValue,
+        reason: statusReason.trim(),
+      });
+      setBook((current) => (current ? { ...current, status: response.status } : current));
+      setSuccessMessage('도서 상태가 변경되었습니다.');
+      setStatusReason('');
+      setIsStatusModalOpen(false);
+    } catch (error) {
+      setStatusErrorMessage(getApiErrorMessage(error));
+    } finally {
+      setIsChangingStatus(false);
+    }
+  }
+
+  function prepareEpubUpload() {
+    setEpubErrorMessage('');
+    setEpubSuccessMessage('');
+
+    if (!numericBookId) {
+      setEpubErrorMessage('EPUB을 등록할 도서 번호를 확인할 수 없습니다.');
+      return;
+    }
+
+    if (!epubFile) {
+      setEpubErrorMessage('업로드할 EPUB 파일을 선택해 주세요.');
+      return;
+    }
+
+    if (!epubFile.name.toLowerCase().endsWith('.epub')) {
+      setEpubErrorMessage('.epub 확장자 파일만 업로드할 수 있습니다.');
+      return;
+    }
+
+    if (epubFile.size > MAX_EPUB_FILE_SIZE) {
+      setEpubErrorMessage('EPUB 파일은 50MB 이하만 업로드할 수 있습니다.');
+      return;
+    }
+
+    setIsEpubConfirmOpen(true);
+  }
+
+  async function handleEpubUpload() {
+    if (!numericBookId || !epubFile) {
+      setIsEpubConfirmOpen(false);
+      setEpubErrorMessage('업로드할 도서와 EPUB 파일을 다시 확인해 주세요.');
+      return;
+    }
+
+    setIsUploadingEpub(true);
+
+    try {
+      const response = await uploadAdminBookEpub(numericBookId, epubFile);
+      setEpubSuccessMessage(`${response.fileName} 업로드 완료 (EPUB version ${response.epubVersion})`);
+      setEpubFile(null);
+    } catch (error) {
+      setEpubErrorMessage(getApiErrorMessage(error));
+    } finally {
+      setIsUploadingEpub(false);
+      setIsEpubConfirmOpen(false);
+    }
+  }
+
+  function handleEpubDialogKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      if (!isUploadingEpub) {
+        setIsEpubConfirmOpen(false);
+      }
+      return;
+    }
+
+    if (event.key !== 'Tab') {
+      return;
+    }
+
+    const dialog = epubDialogRef.current;
+    const focusableElements = dialog
+      ? Array.from(dialog.querySelectorAll<HTMLElement>('button:not([disabled])'))
+      : [];
+
+    if (focusableElements.length === 0) {
+      event.preventDefault();
+      return;
+    }
+
+    const firstElement = focusableElements[0];
+    const lastElement = focusableElements[focusableElements.length - 1];
+    const activeElement = document.activeElement;
+
+    if (event.shiftKey && (activeElement === firstElement || !dialog?.contains(activeElement))) {
+      event.preventDefault();
+      lastElement.focus();
+    } else if (!event.shiftKey && activeElement === lastElement) {
+      event.preventDefault();
+      firstElement.focus();
+    }
+  }
+
+  if (isLoading || !book) {
+    return (
+      <section className={`page-section ${styles.page}`}>
+        <div className={styles.header}>
+          <div>
+            <span className={styles.eyebrow}>Book</span>
+            <h1>도서 수정</h1>
+            <p>{isLoading ? '기존 도서 정보를 불러오는 중입니다.' : errorMessage || '도서 정보를 불러오지 못했습니다.'}</p>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className={`page-section ${styles.page}`}>
+      <div className={styles.header}>
+        <div>
+          <span className={styles.eyebrow}>Book</span>
+          <h1>도서 수정</h1>
+          <p>기존 도서 정보와 전자책 본문을 수정한 뒤 저장합니다.</p>
+        </div>
+
+        <div className={styles.headerActions}>
+          <Button type="submit" form="admin-book-edit-form" disabled={isSubmitting}>
+            {isSubmitting ? '저장 중' : '저장'}
+          </Button>
+          <Button type="button" variant="danger" onClick={() => setIsStatusModalOpen(true)}>
+            상태 변경
+          </Button>
+          <Link className="button button-secondary" to="/admin/books">
+            취소
+          </Link>
+        </div>
+      </div>
+
+      {errorMessage ? <p className={styles.error}>{errorMessage}</p> : null}
+      {successMessage ? <p className={styles.success}>{successMessage}</p> : null}
+
+      <form id="admin-book-edit-form" key={book.bookId} className={styles.form} onSubmit={handleSubmit}>
+        <div className={styles.formGrid}>
+          <section className={styles.panel}>
+            <div className={styles.panelHeader}>
+              <h2>기본 정보</h2>
+              <p>제목, ISBN, 출판사, 저자 표시 순서를 입력합니다.</p>
+            </div>
+
+            <div className={styles.fieldGrid}>
+              <label className={styles.wide}>
+                제목
+                <input name="title" type="text" placeholder="데이터베이스 개론" defaultValue={book.title} />
+              </label>
+              <label>
+                ISBN
+                <input name="isbn" type="text" placeholder="979-11-0001" defaultValue={book.isbn ?? ''} />
+              </label>
+              <label>
+                출판사명
+                <input name="publisherName" type="text" placeholder="ABC Press" defaultValue={book.publisherName ?? ''} />
+              </label>
+              <label className={styles.wide}>
+                저자
+                <input
+                  name="authors"
+                  type="text"
+                  placeholder="김하늘 / 1"
+                  defaultValue={(book.authors ?? []).map((author) => author.authorName).join(', ')}
+                />
+              </label>
+              <label className={styles.wide}>
+                키워드
+                <input name="keywords" type="text" placeholder="SQL, RDBMS, 실무 데이터" />
+              </label>
+            </div>
+          </section>
+
+          <section className={styles.panel}>
+            <div className={styles.panelHeader}>
+              <h2>분류/대여/표시</h2>
+              <p>카테고리, 대여 유형, 가격, 상태를 설정합니다.</p>
+            </div>
+
+            <div className={styles.fieldGrid}>
+              <label className={styles.wide}>
+                문학 카테고리
+                <select name="categoryIds" multiple size={5} defaultValue={(book.categories ?? []).map((category) => String(category.categoryId))}>
+                  {categories.map((category) => (
+                    <option value={category.categoryId} key={category.categoryId}>
+                      {category.name || category.categoryName}
+                      {selectedCategoryIds.has(category.categoryId) ? ' · 선택됨' : ''}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                대여 유형
+                <select name="rentalType" value={rentalType} onChange={(event) => setRentalType(event.target.value as AdminBookRentalType)}>
+                  <option value="PAID">유료</option>
+                  <option value="FREE">무료</option>
+                </select>
+              </label>
+              <label>
+                기본 대여일
+                <input name="defaultRentalDays" type="number" min="1" placeholder="14" defaultValue={book.defaultRentalDays ?? 14} />
+              </label>
+              <label>
+                대여 가격
+                <input
+                  name="rentalPrice"
+                  type="number"
+                  min="0"
+                  placeholder="3500"
+                  defaultValue={rentalType === 'FREE' ? '0' : String(book.rentalPrice ?? 3500)}
+                  disabled={rentalType === 'FREE'}
+                />
+              </label>
+              <label>
+                상태
+                <select name="status" value={statusValue} onChange={(event) => setStatusValue(event.target.value as AdminBookStatus)}>
+                  <option value="AVAILABLE">AVAILABLE</option>
+                  <option value="HIDDEN">HIDDEN</option>
+                  <option value="INACTIVE">INACTIVE</option>
+                </select>
+              </label>
+            </div>
+          </section>
+        </div>
+
+        <div className={styles.formGrid}>
+          <section className={styles.panel}>
+            <div className={styles.panelHeader}>
+              <h2>상세 입력</h2>
+              <p>책 소개, 목차, 출판사 리뷰를 수정합니다.</p>
+            </div>
+
+            <label>
+              책 소개
+              <textarea
+                name="description"
+                placeholder="데이터베이스의 기본 개념과 실무 활용을 함께 익힐 수 있는 도서입니다."
+                defaultValue={book.detail?.description ?? ''}
+              />
+            </label>
+            <div className={styles.fieldGrid}>
+              <label>
+                목차
+                <textarea name="tableOfContents" placeholder={'1장 데이터 모델\n2장 SQL 기초'} defaultValue={book.detail?.tableOfContents ?? ''} />
+              </label>
+              <label>
+                출판사 리뷰/상세 내용
+                <textarea
+                  name="publisherReview"
+                  placeholder="학습자를 위한 구성과 실무 예제를 담았습니다."
+                  defaultValue={book.detail?.publisherReview ?? ''}
+                />
+              </label>
+            </div>
+          </section>
+
+          <section className={styles.panel}>
+            <div className={styles.panelHeader}>
+              <h2>전자책 콘텐츠</h2>
+              <p>도서 정보 저장과 별도로 EPUB 본문을 등록합니다. 새 파일을 올리면 EPUB version이 증가합니다.</p>
+            </div>
+
+            <label>
+              커버 URL
+              <input
+                name="coverImageUrl"
+                type="url"
+                placeholder="https://cdn.example.com/book-1001.jpg"
+                defaultValue={book.coverImageUrl ?? ''}
+              />
+            </label>
+
+            <div className={styles.epubUpload}>
+              <strong>대상 도서 ID: {numericBookId}</strong>
+              <p className={styles.epubWarning}>
+                기존 EPUB을 교체하면 이 도서를 이용 중인 사용자의 읽기 진행률이 초기화되고 기존 북마크가 삭제됩니다.
+              </p>
+              <label>
+                EPUB 파일
+                <input
+                  ref={epubFileInputRef}
+                  key={epubFile?.name ?? 'empty-epub-file'}
+                  type="file"
+                  accept=".epub,application/epub+zip"
+                  onChange={(event) => {
+                    setEpubFile(event.target.files?.[0] ?? null);
+                    setEpubErrorMessage('');
+                    setEpubSuccessMessage('');
+                  }}
+                />
+              </label>
+              <div className={styles.epubUploadActions}>
+                <span>{epubFile ? `${epubFile.name} (${(epubFile.size / 1024 / 1024).toFixed(1)}MB)` : '50MB 이하 .epub 파일'}</span>
+                <Button type="button" onClick={prepareEpubUpload} disabled={isUploadingEpub || !epubFile}>
+                  {isUploadingEpub ? 'EPUB 업로드 중' : 'EPUB 업로드'}
+                </Button>
+              </div>
+              {epubErrorMessage ? <p className={styles.uploadError} role="alert">{epubErrorMessage}</p> : null}
+              {epubSuccessMessage ? <p className={styles.uploadSuccess} role="status" aria-live="polite">{epubSuccessMessage}</p> : null}
+            </div>
+          </section>
+        </div>
+
+        <section className={styles.panel}>
+          <div className={styles.panelHeader}>
+            <h2>검증 및 운영 기준</h2>
+            <p>수정 전에 확인해야 하는 규칙입니다.</p>
+          </div>
+
+          <div className={styles.ruleGrid}>
+            <span>ISBN 중복 없음</span>
+            <span>유료 도서 가격 0원 초과</span>
+            <span>무료 도서 가격 0원</span>
+            <span>EPUB 등록 후 열람 가능</span>
+            <span>카테고리 1개 이상 선택</span>
+            <span>수정 활동 로그 기록</span>
+          </div>
+        </section>
+      </form>
+
+      {isEpubConfirmOpen ? (
+        <div
+          className={styles.modalBackdrop}
+          role="presentation"
+          onMouseDown={() => {
+            if (!isUploadingEpub) {
+              setIsEpubConfirmOpen(false);
+            }
+          }}
+        >
+          <div
+            ref={epubDialogRef}
+            className={styles.modal}
+            role="dialog"
+            aria-modal="true"
+            aria-busy={isUploadingEpub}
+            aria-labelledby="epub-upload-modal-title"
+            aria-describedby="epub-upload-modal-description"
+            onKeyDown={handleEpubDialogKeyDown}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className={styles.modalHeader}>
+              <h2 id="epub-upload-modal-title">EPUB 파일 업로드 확인</h2>
+              <p id="epub-upload-modal-description">
+                도서 ID {numericBookId}에 {epubFile?.name} 파일을 등록합니다.
+              </p>
+            </div>
+
+            <p className={styles.epubWarning}>
+              기존 콘텐츠가 있다면 사용자 읽기 진행률이 초기화되고 기존 북마크가 삭제됩니다. 이 작업을 계속하시겠습니까?
+            </p>
+
+            <div className={styles.modalActions}>
+              <Button type="button" variant="secondary" onClick={() => setIsEpubConfirmOpen(false)} disabled={isUploadingEpub}>
+                취소
+              </Button>
+              <Button type="button" variant="danger" onClick={handleEpubUpload} disabled={isUploadingEpub}>
+                {isUploadingEpub ? '업로드 중' : '영향을 확인하고 업로드'}
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {isStatusModalOpen ? (
+        <div className={styles.modalBackdrop} role="presentation" onMouseDown={() => setIsStatusModalOpen(false)}>
+          <div className={styles.modal} role="dialog" aria-modal="true" aria-labelledby="book-status-modal-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className={styles.modalHeader}>
+              <h2 id="book-status-modal-title">도서 상태 변경</h2>
+              <p>숨김, 비활성 처리처럼 노출 상태가 바뀌는 경우 사유를 남깁니다.</p>
+            </div>
+
+            <label>
+              상태
+              <select value={statusValue} onChange={(event) => setStatusValue(event.target.value as AdminBookStatus)}>
+                <option value="AVAILABLE">AVAILABLE</option>
+                <option value="HIDDEN">HIDDEN</option>
+                <option value="INACTIVE">INACTIVE</option>
+              </select>
+            </label>
+
+            <label>
+              변경 사유
+              <textarea value={statusReason} onChange={(event) => setStatusReason(event.target.value)} placeholder="예: 표지 이미지 교체 전까지 임시 숨김 처리" />
+            </label>
+
+            {statusErrorMessage ? <p className={styles.modalError}>{statusErrorMessage}</p> : null}
+
+            <div className={styles.modalActions}>
+              <Button type="button" variant="secondary" onClick={() => setIsStatusModalOpen(false)}>
+                닫기
+              </Button>
+              <Button type="button" variant="danger" onClick={handleStatusChange} disabled={isChangingStatus}>
+                {isChangingStatus ? '변경 중' : '상태 변경'}
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
