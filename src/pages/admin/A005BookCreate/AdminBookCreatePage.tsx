@@ -1,0 +1,317 @@
+import { FormEvent, useEffect, useState } from 'react';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { createAdminBook } from '../../../api/adminBookApi';
+import { updateAdminBookRequestCandidateStatus } from '../../../api/adminBookRequestApi';
+import { getCategories } from '../../../api/bookApi';
+import { getApiErrorMessage } from '../../../api/profileApi';
+import { Button } from '../../../components/common/Button';
+import type {
+  AdminBookCreateRequest,
+  AdminBookRentalType,
+  Category,
+} from '../../../types/api';
+import styles from '../../../styles/AdminBookFormPage.module.css';
+
+const fallbackCategories: Category[] = [
+  { categoryId: 1, name: '소설' },
+  { categoryId: 2, name: '경제 / 경영' },
+  { categoryId: 3, name: '인문 / 사회 / 역사' },
+  { categoryId: 4, name: '컴퓨터 / IT' },
+  { categoryId: 5, name: '자기계발' },
+];
+
+function flattenCategories(categories: Category[]): Category[] {
+  return categories.flatMap((category) => [category, ...(category.children ? flattenCategories(category.children) : [])]);
+}
+
+function splitList(value: FormDataEntryValue | null) {
+  return String(value ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+// 희망도서 관리 화면(AdminBookRequestPage)의 "도서 등록" 액션에서 넘어온 경우에만 채워진다.
+type BookRequestPrefillState = { title?: string; author?: string; publisher?: string } | null;
+
+export function AdminBookCreatePage() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const candidateIdParam = searchParams.get('candidateId');
+  const candidateId = candidateIdParam ? Number(candidateIdParam) : null;
+  const prefill = (location.state as BookRequestPrefillState) ?? null;
+  const [categories, setCategories] = useState<Category[]>(fallbackCategories);
+  const [rentalType, setRentalType] = useState<AdminBookRentalType>('PAID');
+  const [errorMessage, setErrorMessage] = useState('');
+  const [successMessage, setSuccessMessage] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  useEffect(() => {
+    let ignore = false;
+
+    async function loadCategories() {
+      try {
+        const data = await getCategories();
+        if (!ignore) {
+          setCategories(data.length ? flattenCategories(data) : fallbackCategories);
+        }
+      } catch {
+        if (!ignore) {
+          setCategories(fallbackCategories);
+        }
+      }
+    }
+
+    void loadCategories();
+
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setErrorMessage('');
+    setSuccessMessage('');
+
+    const formData = new FormData(event.currentTarget);
+    const title = String(formData.get('title') ?? '').trim();
+    const publisherName = String(formData.get('publisherName') ?? '').trim();
+    const authors = splitList(formData.get('authors'));
+    const categoryIds = formData
+      .getAll('categoryIds')
+      .map((value) => Number(value))
+      .filter(Boolean);
+
+    if (!title) {
+      setErrorMessage('도서 제목을 입력해 주세요.');
+      return;
+    }
+
+    if (!publisherName) {
+      setErrorMessage('출판사를 입력해 주세요.');
+      return;
+    }
+
+    if (authors.length === 0) {
+      setErrorMessage('저자를 1명 이상 입력해 주세요.');
+      return;
+    }
+
+    if (categoryIds.length === 0) {
+      setErrorMessage('카테고리를 1개 이상 선택해 주세요.');
+      return;
+    }
+
+    const rentalPrice = rentalType === 'FREE' ? 0 : Number(formData.get('rentalPrice') ?? 0);
+
+    if (rentalType === 'PAID' && rentalPrice <= 0) {
+      setErrorMessage('유료 도서는 대여 가격을 1원 이상 입력해야 합니다.');
+      return;
+    }
+
+    const payload: AdminBookCreateRequest = {
+      title,
+      isbn: String(formData.get('isbn') ?? '').trim() || undefined,
+      publisherName,
+      authors,
+      categoryIds,
+      rentalType,
+      rentalPrice,
+      defaultRentalDays: Number(formData.get('defaultRentalDays') ?? 14) || 14,
+      coverImageUrl: String(formData.get('coverImageUrl') ?? '').trim() || undefined,
+      description: String(formData.get('description') ?? '').trim() || undefined,
+      tableOfContents: String(formData.get('tableOfContents') ?? '').trim() || undefined,
+      publisherReview: String(formData.get('publisherReview') ?? '').trim() || undefined,
+    };
+
+    setIsSubmitting(true);
+
+    try {
+      const response = await createAdminBook(payload);
+
+      if (candidateId) {
+        try {
+          await updateAdminBookRequestCandidateStatus(candidateId, { status: 'APPROVED', approvedBookId: response.bookId });
+          setSuccessMessage('도서가 등록되고 희망도서 후보가 승인 처리되었습니다.');
+        } catch (linkError) {
+          setSuccessMessage(
+            `도서가 등록되었습니다(B-${response.bookId}). 다만 희망도서 후보 승인 연동은 실패했습니다: ` +
+              `${getApiErrorMessage(linkError)} 희망도서 관리 화면에서 승인도서 번호 B-${response.bookId}로 수동 승인해 주세요.`,
+          );
+        }
+      } else {
+        setSuccessMessage('도서가 등록되었습니다.');
+      }
+
+      navigate(`/admin/books/${response.bookId}/edit`);
+    } catch (error) {
+      setErrorMessage(getApiErrorMessage(error));
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  return (
+    <section className={`page-section ${styles.page}`}>
+      <div className={styles.header}>
+        <div>
+          <span className={styles.eyebrow}>Book</span>
+          <h1>도서 등록</h1>
+          <p>도서 기본 정보, 상세 입력, 전자책 페이지 정보를 등록합니다.</p>
+        </div>
+
+        <div className={styles.headerActions}>
+          <Button type="submit" form="admin-book-create-form" disabled={isSubmitting}>
+            {isSubmitting ? '등록 중' : '등록'}
+          </Button>
+          <Link className="button button-secondary" to="/admin/books">
+            취소
+          </Link>
+        </div>
+      </div>
+
+      {candidateId ? (
+        <p className={styles.notice}>
+          희망도서 후보 BR-{candidateId}에서 연계되었습니다. 등록 완료 시 해당 후보가 자동으로 승인 처리됩니다.
+        </p>
+      ) : null}
+      {errorMessage ? <p className={styles.error}>{errorMessage}</p> : null}
+      {successMessage ? <p className={styles.success}>{successMessage}</p> : null}
+
+      <form id="admin-book-create-form" className={styles.form} onSubmit={handleSubmit}>
+        <div className={styles.formGrid}>
+          <section className={styles.panel}>
+            <div className={styles.panelHeader}>
+              <h2>기본 정보</h2>
+              <p>제목, ISBN, 출판사, 저자를 입력합니다.</p>
+            </div>
+
+            <div className={styles.fieldGrid}>
+              <label className={styles.wide}>
+                제목
+                <input name="title" type="text" placeholder="도서 제목" defaultValue={prefill?.title ?? ''} />
+              </label>
+              <label>
+                ISBN
+                <input name="isbn" type="text" placeholder="ISBN" />
+              </label>
+              <label>
+                출판사명
+                <input name="publisherName" type="text" placeholder="출판사명" defaultValue={prefill?.publisher ?? ''} />
+              </label>
+              <label className={styles.wide}>
+                저자
+                <input name="authors" type="text" placeholder="저자명 / 표시 순서" defaultValue={prefill?.author ?? ''} />
+              </label>
+              <label className={styles.wide}>
+                키워드
+                <input name="keywords" type="text" placeholder="키워드" />
+              </label>
+            </div>
+          </section>
+
+          <section className={styles.panel}>
+            <div className={styles.panelHeader}>
+              <h2>분류/대여/표시</h2>
+              <p>카테고리, 대여 유형, 가격, 표시 상태를 설정합니다.</p>
+            </div>
+
+            <div className={styles.fieldGrid}>
+              <label className={styles.wide}>
+                문학 카테고리
+                <select name="categoryIds" multiple size={5}>
+                  {categories.map((category) => (
+                    <option value={category.categoryId} key={category.categoryId}>
+                      {category.name || category.categoryName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                대여 유형
+                <select name="rentalType" value={rentalType} onChange={(event) => setRentalType(event.target.value as AdminBookRentalType)}>
+                  <option value="PAID">유료</option>
+                  <option value="FREE">무료</option>
+                </select>
+              </label>
+              <label>
+                기본 대여일
+                <input name="defaultRentalDays" type="number" min="1" defaultValue="14" />
+              </label>
+              <label>
+                대여 가격
+                <input name="rentalPrice" type="number" min="0" defaultValue={rentalType === 'FREE' ? '0' : '3500'} disabled={rentalType === 'FREE'} />
+              </label>
+              <label>
+                상태
+                <select name="status" defaultValue="AVAILABLE">
+                  <option value="AVAILABLE">AVAILABLE</option>
+                  <option value="HIDDEN">HIDDEN</option>
+                  <option value="INACTIVE">INACTIVE</option>
+                </select>
+              </label>
+            </div>
+          </section>
+        </div>
+
+        <div className={styles.formGrid}>
+          <section className={styles.panel}>
+            <div className={styles.panelHeader}>
+              <h2>상세 입력</h2>
+              <p>책 소개, 목차, 출판사 리뷰를 입력합니다.</p>
+            </div>
+
+            <label>
+              책 소개
+              <textarea name="description" placeholder="이 책의 핵심 내용과 특징을 간단히 입력합니다." />
+            </label>
+            <div className={styles.fieldGrid}>
+              <label>
+                목차
+                <textarea name="tableOfContents" placeholder="1장 데이터 모델&#10;2장 SQL 기초" />
+              </label>
+              <label>
+                출판사 리뷰/상세 내용
+                <textarea name="publisherReview" placeholder="학습자를 위한 구성과 실무 예제를 작성합니다." />
+              </label>
+            </div>
+          </section>
+
+          <section className={styles.panel}>
+            <div className={styles.panelHeader}>
+              <h2>전자책 콘텐츠</h2>
+              <p>도서를 등록한 뒤 Swagger 또는 Postman에서 EPUB 파일을 등록합니다.</p>
+            </div>
+
+            <label>
+              커버 URL
+              <input name="coverImageUrl" type="url" placeholder="https://cdn.example.com/book-1001.jpg" />
+            </label>
+            <div className={styles.ruleGrid}>
+              <span>콘텐츠 상태: EPUB 미등록</span>
+              <span>EPUB 등록 전에는 사용자가 본문을 열람할 수 없습니다.</span>
+            </div>
+          </section>
+        </div>
+
+        <section className={styles.panel}>
+          <div className={styles.panelHeader}>
+            <h2>검증 및 운영 기준</h2>
+            <p>등록 전에 확인해야 하는 규칙입니다.</p>
+          </div>
+
+          <div className={styles.ruleGrid}>
+            <span>ISBN 중복 없음</span>
+            <span>유료 도서 가격 0원 초과</span>
+            <span>무료 도서 가격 0원</span>
+            <span>EPUB 등록 후 열람 가능</span>
+            <span>카테고리 1개 이상 선택</span>
+            <span>감사 로그는 서버에서 기록</span>
+          </div>
+        </section>
+      </form>
+    </section>
+  );
+}
