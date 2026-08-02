@@ -1,0 +1,56 @@
+name: Frontend CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # 09:32 Asia/Seoul (UTC+09:00)
+    - cron: "32 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect application sources
+        id: project
+        shell: bash
+        run: |
+          if [[ -f "package.json" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js
+        if: steps.project.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.project.outputs.present == 'true'
+        run: npm ci
+
+      - name: Lint
+        if: steps.project.outputs.present == 'true'
+        run: npm run lint
+
+      - name: Build
+        if: steps.project.outputs.present == 'true'
+        run: npm run build
+
+      - name: Bootstrap confirmation
+        if: steps.project.outputs.present != 'true'
+        run: echo "No frontend source has been migrated yet; CI bootstrap completed."
